@@ -57,7 +57,7 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
 
     let answerText: string | null = null;
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 6500);
+    const timeoutId = window.setTimeout(() => controller.abort(), 4500);
 
     try {
       const res = await fetch('/api/assistant', {

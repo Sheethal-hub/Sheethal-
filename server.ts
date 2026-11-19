@@ -355,15 +355,26 @@ Rules:
 
   try {
     let answer: string | null = null;
+    let shouldTrySecondary = true;
+
     try {
-      answer = await callModelWithTimeout('gemini-4-hydrogen', 3200);
-    } catch {
-      // Fast fallback to flash-lite if hydrogen is slow or experiencing high demand
+      answer = await callModelWithTimeout('gemini-4-hydrogen', 2800);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // On 429 rate-limit or auth errors, skip secondary Gemini call and answer immediately via built-in rules
+      if (
+        /\b(400|401|403|429)\b/.test(msg) ||
+        msg.includes('RESOURCE_EXHAUSTED') ||
+        msg.includes('PERMISSION_DENIED') ||
+        msg.includes('API_KEY_INVALID')
+      ) {
+        shouldTrySecondary = false;
+      }
     }
 
-    if (!answer) {
+    if (!answer && shouldTrySecondary) {
       try {
-        answer = await callModelWithTimeout('gemini-3.1-flash-lite', 2600);
+        answer = await callModelWithTimeout('gemini-3.1-flash-lite', 2200);
       } catch {
         // Fall through cleanly to built-in smart health & AQI rules
       }

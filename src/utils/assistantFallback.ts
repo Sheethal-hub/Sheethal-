@@ -49,6 +49,8 @@ export function buildSmartAqiReply(
   const ventRec = recs.find((r) => r.category === 'ventilation')!;
   const local = getLocalMetroAdvisory(data, profile);
 
+  const pollutantSummary = `PM2.5 **${data.pm25} µg/m³**, PM10 **${data.pm10} µg/m³**, and NO2 **${data.no2} µg/m³** (dominant: **${data.dominantPollutant}**)`;
+
   const mentionedHour = parseMentionedHour(q);
   const hourPoint =
     mentionedHour !== null ? findHourlyPoint(data.hourly, mentionedHour) : undefined;
@@ -75,49 +77,45 @@ export function buildSmartAqiReply(
     if (hourPoint) {
       const hourRiskNote =
         hourPoint.band === 'peak'
-          ? `That falls inside a higher-load period for ${data.neighborhood}, with AQI projected around **${hourPoint.aqi} (${hourPoint.status})**, PM2.5 near **${hourPoint.pm25} µg/m³**, and NO2 around **${hourPoint.no2} µg/m³**.`
+          ? `At **${hourPoint.hourLabel}**, **${data.neighborhood}, ${data.city}** enters a peak traffic/pollution period with AQI projected around **${hourPoint.aqi} (${hourPoint.status})** (hour PM2.5 **${hourPoint.pm25} µg/m³**, NO2 **${hourPoint.no2} µg/m³**).`
           : hourPoint.band === 'clean'
-          ? `That lines up with one of the cleaner hours in ${data.neighborhood}, with AQI projected near **${hourPoint.aqi} (${hourPoint.status})** and PM2.5 around **${hourPoint.pm25} µg/m³**.`
-          : `At **${hourPoint.hourLabel}**, ${data.neighborhood} is projected at **AQI ${hourPoint.aqi} (${hourPoint.status})** (PM2.5 **${hourPoint.pm25} µg/m³**, NO2 **${hourPoint.no2} µg/m³**).`;
+          ? `At **${hourPoint.hourLabel}**, **${data.neighborhood}, ${data.city}** is in a cleaner dispersion window with AQI projected near **${hourPoint.aqi} (${hourPoint.status})** (hour PM2.5 **${hourPoint.pm25} µg/m³**, NO2 **${hourPoint.no2} µg/m³**).`
+          : `At **${hourPoint.hourLabel}**, **${data.neighborhood}, ${data.city}** is projected at **AQI ${hourPoint.aqi} (${hourPoint.status})** (hour PM2.5 **${hourPoint.pm25} µg/m³**, NO2 **${hourPoint.no2} µg/m³**).`;
 
       const actionAdvice =
         hourPoint.aqi >= 150 || (profile !== 'general' && hourPoint.aqi >= 100)
-          ? `For **${profileMeta.label}**, I recommend moving intense cardio indoors or shifting your session to the cleanest window today (**${data.cleanestWindow.label}**, avg AQI **${data.cleanestWindow.avgAqi}**).`
-          : `For **${profileMeta.label}**, the recommendation is **${exerciseRec.verdict}**—stick to tree-lined side streets away from arterial traffic and watch for peak buildup around **${data.peakTrafficWindow.label}**.`;
+          ? `For **${profileMeta.label}**, shift intense cardio indoors or aim for today's cleanest window (**${data.cleanestWindow.label}**, avg AQI **${data.cleanestWindow.avgAqi}**).`
+          : `For **${profileMeta.label}**, outdoor guidance is **${exerciseRec.verdict}**—stick to tree-lined side streets away from main roads and avoid **${data.peakTrafficWindow.label}** (avg AQI **${data.peakTrafficWindow.avgAqi}**).`;
 
-      const maskNote =
-        maskRec.verdict !== 'Not Required'
-          ? ` Mask guidance during peak traffic is **${maskRec.verdict}**.`
-          : '';
-
-      return `${hourRiskNote}\n\n${actionAdvice}${maskNote}`;
+      return `${hourRiskNote}\n\n• **Current Baseline:** AQI **${data.aqi} (${data.status})** with ${pollutantSummary}.\n• **Safety Plan (${profileMeta.label}):** ${actionAdvice} Mask guidance: **${maskRec.verdict}**.`;
     }
 
-    return `In **${data.neighborhood}, ${data.city}** (current **AQI ${data.aqi} · ${data.status}**), the outdoor activity guidance for **${profileMeta.label}** is **${exerciseRec.verdict}**.\n\n${exerciseRec.detail} Aim for **${data.cleanestWindow.label}** (avg AQI **${data.cleanestWindow.avgAqi}**) and avoid **${data.peakTrafficWindow.label}** (avg AQI **${data.peakTrafficWindow.avgAqi}**).`;
+    return `In **${data.neighborhood}, ${data.city}** (current **AQI ${data.aqi} · ${data.status}**), outdoor activity guidance for **${profileMeta.label}** is **${exerciseRec.verdict}**.\n\n• **Pollutant Levels:** ${pollutantSummary}.\n• **Guidance:** ${exerciseRec.detail}\n• **Best Timing:** Target **${data.cleanestWindow.label}** (avg AQI **${data.cleanestWindow.avgAqi}**) and avoid **${data.peakTrafficWindow.label}** (avg AQI **${data.peakTrafficWindow.avgAqi}**).`;
   }
 
   // 2. Indoor dust / ventilation / home air question
   if (isIndoorDustQuery) {
     const dustDetail =
       data.pm10 > 70
-        ? `Coarse dust (PM10) is elevated at **${data.pm10} µg/m³** alongside PM2.5 at **${data.pm25} µg/m³**. Avoid dry sweeping or feather dusting, which puts settled dust right back into breathing height.`
-        : `Ambient PM10 is **${data.pm10} µg/m³** and PM2.5 is **${data.pm25} µg/m³**.`;
+        ? `Coarse dust (PM10) is elevated at **${data.pm10} µg/m³** alongside PM2.5 at **${data.pm25} µg/m³** and NO2 at **${data.no2} µg/m³**. Avoid dry sweeping, which resuspends settled dust into breathing height.`
+        : `Current readings in **${data.neighborhood}** are ${pollutantSummary}.`;
 
-    return `For **${data.neighborhood}** right now (**AQI ${data.aqi} · ${data.status}**), the ventilation status is **${ventRec.verdict}**.\n\n${dustDetail} ${ventRec.detail}\n\nPractical steps today: damp-mop hard floors with a microfiber cloth, keep shoes at the entryway, and if you open windows, limit airing to **${data.cleanestWindow.label}** (avg AQI **${data.cleanestWindow.avgAqi}**).`;
+    return `For **${data.neighborhood}, ${data.city}** (**AQI ${data.aqi} · ${data.status}**) and the **${profileMeta.label}** profile, window ventilation guidance is **${ventRec.verdict}**.\n\n• **Indoor Air & Dust:** ${dustDetail} ${ventRec.detail}\n• **Practical Steps:** Damp-mop floors with microfiber, keep outdoor shoes at the entry, and restrict any brief window airing to **${data.cleanestWindow.label}** (avg AQI **${data.cleanestWindow.avgAqi}**).`;
   }
 
   // 3. Mask / commute / traffic question
   if (isMaskCommuteQuery) {
-    return `For **${profileMeta.label}** commuting through **${data.neighborhood}, ${data.city}** (**AQI ${data.aqi} · ${data.status}**), mask guidance is **${maskRec.verdict}**.\n\n${maskRec.detail} Current traffic-related NO2 is **${data.no2} µg/m³** and PM2.5 is **${data.pm25} µg/m³**.\n\n**Local commute tip:** ${local.commuteTip}. Stepping one block off main roads also cuts roadside exhaust spikes substantially.`;
+    return `For **${profileMeta.label}** commuting through **${data.neighborhood}, ${data.city}** (**AQI ${data.aqi} · ${data.status}**), mask protection is **${maskRec.verdict}**.\n\n• **Exposure Snapshot:** ${pollutantSummary}.\n• **Mask & Fit:** ${maskRec.detail} ${maskRec.timingNote}.\n• **Local Commute Tip:** ${local.commuteTip}. Stepping one block off arterial roads reduces tailpipe NO2 spikes significantly.`;
   }
 
   // 4. Pollutant / cause / meteorological breakdown
   if (isPollutantWhyQuery) {
     const whoPm25Ratio = (data.pm25 / 15).toFixed(1);
+    const whoPm10Ratio = (data.pm10 / 45).toFixed(1);
     const whoNo2Ratio = (data.no2 / 25).toFixed(1);
-    return `**${data.neighborhood}** is currently at **AQI ${data.aqi} (${data.status})**, driven primarily by **${data.dominantPollutant}**.\n\n• **PM2.5:** ${data.pm25} µg/m³ (${whoPm25Ratio}× the WHO 24h guideline of 15 µg/m³)\n• **PM10:** ${data.pm10} µg/m³ (WHO guideline: 45 µg/m³)\n• **NO2:** ${data.no2} µg/m³ (${whoNo2Ratio}× the WHO guideline of 25 µg/m³)\n\nWith **${data.windKmh} km/h** winds and **${data.humidityPct}%** humidity, air is cleanest around **${data.cleanestWindow.label}** (avg AQI **${data.cleanestWindow.avgAqi}**) and heaviest during **${data.peakTrafficWindow.label}** (avg AQI **${data.peakTrafficWindow.avgAqi}**).`;
+    return `**${data.neighborhood}, ${data.city}** is at **AQI ${data.aqi} (${data.status})**, led by **${data.dominantPollutant}**.\n\n• **PM2.5:** ${data.pm25} µg/m³ (${whoPm25Ratio}× WHO 24h limit of 15 µg/m³)\n• **PM10:** ${data.pm10} µg/m³ (${whoPm10Ratio}× WHO 24h limit of 45 µg/m³)\n• **NO2:** ${data.no2} µg/m³ (${whoNo2Ratio}× WHO 24h limit of 25 µg/m³)\n\nFor **${profileMeta.label}**, keep heavy exertion to **${data.cleanestWindow.label}** (avg AQI **${data.cleanestWindow.avgAqi}**) when **${data.windKmh} km/h** wind disperses buildup, and take precautions during **${data.peakTrafficWindow.label}**.`;
   }
 
-  // 5. General catch-all summary tailored to city + profile
-  return `Right now in **${data.neighborhood}, ${data.city}**, air quality is **AQI ${data.aqi} (${data.status})**, led by **${data.dominantPollutant}** (PM2.5 **${data.pm25} µg/m³**, PM10 **${data.pm10} µg/m³**, NO2 **${data.no2} µg/m³**).\n\nFor **${profileMeta.label}**:\n• **Outdoor Exercise:** ${exerciseRec.verdict} — ${exerciseRec.timingNote}\n• **Mask Protection:** ${maskRec.verdict}\n• **Window Ventilation:** ${ventRec.verdict}\n\n${local.headline}. ${local.commuteTip}.`;
+  // 5. General catch-all safety summary tailored to city + profile
+  return `Safety briefing for **${data.neighborhood}, ${data.city}** (**AQI ${data.aqi} · ${data.status}**) tailored to **${profileMeta.label}**:\n\n• **Pollutants:** ${pollutantSummary}.\n• **Outdoor Exercise:** ${exerciseRec.verdict} — ${exerciseRec.detail}\n• **Mask Protection:** ${maskRec.verdict} — ${maskRec.timingNote}.\n• **Window Ventilation:** ${ventRec.verdict} — ${ventRec.timingNote}.\n\n${local.headline}. ${local.commuteTip}.`;
 }
