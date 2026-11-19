@@ -1,0 +1,8 @@
+{
+  "name": "AeroSense — Urban Air Quality Assistant",
+  "description": "Real-time urban air quality dashboard with smart health & commute recommendations, 24-hour AQI trends, and a Gemini-powered pollution assistant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
