@@ -4,17 +4,29 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
-  CITY_PRESETS,
   buildSimulatedAirQuality,
   classifyHourBand,
+  computeIndiaNaqi,
   computeWindows,
+  findClosestPresetByCoords,
   formatHourLabel,
   getAqiStatus,
+  getCustomNeighborhoodFactors,
+  getIndiaNaqiStatus,
+  haversineKm,
   no2ToAqi,
   pm10ToAqi,
   pm25ToAqi,
+  resolveCityAndNeighborhood,
 } from './src/data/cities.ts';
-import type { AirQualityPayload, ChatMessage, HourlyPoint, UserProfile } from './src/types/airQuality.ts';
+import type {
+  AirQualityPayload,
+  ChatMessage,
+  DailyOutlookPoint,
+  HourlyPoint,
+  NeighborhoodPreset,
+  UserProfile,
+} from './src/types/airQuality.ts';
 import { buildSmartAqiReply } from './src/utils/assistantFallback.ts';
 
 dotenv.config();
@@ -52,42 +64,171 @@ async function fetchWithTimeout(url: string, timeoutMs = 3500): Promise<Response
   }
 }
 
-async function fetchLiveOpenMeteo(
-  cityQuery: string,
-  neighborhoodQuery?: string
-): Promise<AirQualityPayload | null> {
-  const normalized = cityQuery.trim().toLowerCase();
-  const preset = CITY_PRESETS.find(
-    (c) => c.name.toLowerCase() === normalized || c.id === normalized
-  );
+interface GeoCandidate {
+  name: string;
+  admin1?: string;
+  admin2?: string;
+  country?: string;
+  population?: number;
+  latitude: number;
+  longitude: number;
+}
 
-  let lat = preset?.lat;
-  let lon = preset?.lon;
-  let resolvedCity = preset?.name ?? cityQuery.trim();
-  let resolvedCountry = preset?.country ?? '';
+async function geocodeOpenMeteo(
+  name: string,
+  hint?: string
+): Promise<GeoCandidate | null> {
+  const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+    name.trim()
+  )}&count=8&language=en&format=json`;
+  const geoRes = await fetchWithTimeout(geoUrl, 3000);
+  if (!geoRes.ok) return null;
+  const geoJson = (await geoRes.json()) as { results?: GeoCandidate[] };
+  const results = geoJson.results;
+  if (!results || results.length === 0) return null;
 
-  if (lat === undefined || lon === undefined) {
-    const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
-      cityQuery.trim()
-    )}&count=1&language=en&format=json`;
-    const geoRes = await fetchWithTimeout(geoUrl, 3000);
-    if (!geoRes.ok) return null;
-    const geoJson = (await geoRes.json()) as {
-      results?: { name: string; country?: string; latitude: number; longitude: number }[];
-    };
-    const match = geoJson.results?.[0];
-    if (!match) return null;
-    lat = match.latitude;
-    lon = match.longitude;
-    resolvedCity = match.name;
-    resolvedCountry = match.country ?? 'Global Station';
+  if (hint) {
+    const h = hint.trim().toLowerCase();
+    const hinted = results.filter((r) => {
+      const fields = [r.country, r.admin1, r.admin2, r.name]
+        .filter(Boolean)
+        .map((s) => s!.toLowerCase());
+      return fields.some((f) => f.includes(h) || h.includes(f));
+    });
+    if (hinted.length > 0) {
+      return hinted.sort((a, b) => (b.population ?? 0) - (a.population ?? 0))[0];
+    }
+    return null;
   }
 
-  const aqUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&current=us_aqi,pm10,pm2_5,nitrogen_dioxide&hourly=pm10,pm2_5,nitrogen_dioxide,us_aqi&timezone=auto&forecast_days=1`;
+  return [...results].sort((a, b) => (b.population ?? 0) - (a.population ?? 0))[0];
+}
+
+async function reverseGeocodeCoords(
+  lat: number,
+  lon: number
+): Promise<{ city: string; neighborhood: string; country: string } | null> {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=14`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const res = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'AeroSense-AirAssistant/1.0' },
+      });
+      if (!res.ok) return null;
+      const json = (await res.json()) as {
+        address?: {
+          quarter?: string;
+          neighbourhood?: string;
+          suburb?: string;
+          city_district?: string;
+          city?: string;
+          town?: string;
+          village?: string;
+          state_district?: string;
+          state?: string;
+          country?: string;
+        };
+      };
+      const addr = json.address;
+      if (!addr) return null;
+      const city =
+        addr.city || addr.town || addr.village || addr.state_district || 'Current Area';
+      const neighborhood =
+        addr.suburb || addr.quarter || addr.neighbourhood || addr.city_district || city;
+      const country = [addr.state, addr.country].filter(Boolean).join(', ') || 'GPS Location';
+      return { city, neighborhood, country };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function geocodeNeighborhoodWithinCity(
+  areaName: string,
+  cityName: string,
+  cityLat: number,
+  cityLon: number
+): Promise<{ lat: number; lon: number } | null> {
+  const cleanArea = areaName.trim();
+  if (!cleanArea || cleanArea.toLowerCase() === 'city center') return null;
+
+  try {
+    const omMatch = await geocodeOpenMeteo(cleanArea, cityName);
+    if (
+      omMatch &&
+      haversineKm(cityLat, cityLon, omMatch.latitude, omMatch.longitude) <= 45
+    ) {
+      return { lat: omMatch.latitude, lon: omMatch.longitude };
+    }
+  } catch {
+    // Fall through to Nominatim
+  }
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
+      `${cleanArea}, ${cityName}`
+    )}&format=json&limit=3`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const res = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'AeroSense-AirAssistant/1.0' },
+      });
+      if (!res.ok) return null;
+      const results = (await res.json()) as { lat?: string; lon?: string }[];
+      if (!Array.isArray(results)) return null;
+      for (const item of results) {
+        const candLat = Number(item.lat);
+        const candLon = Number(item.lon);
+        if (
+          Number.isFinite(candLat) &&
+          Number.isFinite(candLon) &&
+          haversineKm(cityLat, cityLon, candLat, candLon) <= 45
+        ) {
+          return { lat: candLat, lon: candLon };
+        }
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLiveOpenMeteoForCoords(params: {
+  lat: number;
+  lon: number;
+  resolvedCity: string;
+  resolvedCountry: string;
+  resolvedNeighborhood: string;
+  zoneType: string;
+  nbFactors?: Pick<NeighborhoodPreset, 'pm25Factor' | 'pm10Factor' | 'no2Factor'> | null;
+  defaultWeather?: { tempC: number; humidityPct: number; windKmh: number };
+}): Promise<AirQualityPayload | null> {
+  const {
+    lat,
+    lon,
+    resolvedCity,
+    resolvedCountry,
+    resolvedNeighborhood,
+    zoneType,
+    nbFactors,
+    defaultWeather,
+  } = params;
+
+  const aqUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&current=us_aqi,pm10,pm2_5,nitrogen_dioxide&hourly=pm10,pm2_5,nitrogen_dioxide,us_aqi&timezone=auto&forecast_days=3`;
   const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m&timezone=auto`;
 
   const [aqRes, weatherRes] = await Promise.all([
-    fetchWithTimeout(aqUrl, 3500),
+    fetchWithTimeout(aqUrl, 3800),
     fetchWithTimeout(weatherUrl, 3500).catch(() => null),
   ]);
 
@@ -103,6 +244,7 @@ async function fetchLiveOpenMeteo(
     hourly?: {
       time?: string[];
       us_aqi?: (number | null)[];
+      pm10?: (number | null)[];
       pm2_5?: (number | null)[];
       nitrogen_dioxide?: (number | null)[];
     };
@@ -112,9 +254,9 @@ async function fetchLiveOpenMeteo(
     return null;
   }
 
-  let tempC = preset?.tempC ?? 20;
-  let humidityPct = preset?.humidityPct ?? 60;
-  let windKmh = preset?.windKmh ?? 12;
+  let tempC = defaultWeather?.tempC ?? 22;
+  let humidityPct = defaultWeather?.humidityPct ?? 60;
+  let windKmh = defaultWeather?.windKmh ?? 12;
 
   if (weatherRes && weatherRes.ok) {
     const wJson = (await weatherRes.json()) as {
@@ -130,35 +272,20 @@ async function fetchLiveOpenMeteo(
     if (wJson.current?.wind_speed_10m != null) windKmh = Math.round(wJson.current.wind_speed_10m);
   }
 
-  const nb = preset
-    ? preset.neighborhoods.find(
-        (n) =>
-          n.name.toLowerCase() === (neighborhoodQuery ?? '').trim().toLowerCase() ||
-          n.id === (neighborhoodQuery ?? '').trim().toLowerCase()
-      ) ?? preset.neighborhoods[0]
-    : null;
-
-  const pm25Factor = nb?.pm25Factor ?? 1;
-  const pm10Factor = nb?.pm10Factor ?? 1;
-  const no2Factor = nb?.no2Factor ?? 1;
-  const aqiOffset = nb?.aqiOffset ?? 0;
+  const pm25Factor = nbFactors?.pm25Factor ?? 1;
+  const pm10Factor = nbFactors?.pm10Factor ?? 1;
+  const no2Factor = nbFactors?.no2Factor ?? 1;
 
   const pm25 = Number(((aqJson.current.pm2_5 ?? 18) * pm25Factor).toFixed(1));
   const pm10 = Number(((aqJson.current.pm10 ?? 34) * pm10Factor).toFixed(1));
   const no2 = Number(((aqJson.current.nitrogen_dioxide ?? 22) * no2Factor).toFixed(1));
 
-  const computedAqi = Math.max(
-    aqJson.current.us_aqi ?? 0,
-    pm25ToAqi(pm25),
-    pm10ToAqi(pm10),
-    no2ToAqi(no2)
-  );
-  const aqi = Math.max(10, Math.min(480, Math.round(computedAqi + aqiOffset)));
-  const status = getAqiStatus(aqi);
-
   const aqiPm25 = pm25ToAqi(pm25);
   const aqiPm10 = pm10ToAqi(pm10);
   const aqiNo2 = no2ToAqi(no2);
+  const aqi = Math.max(10, Math.min(480, Math.max(aqiPm25, aqiPm10, aqiNo2)));
+  const status = getAqiStatus(aqi);
+
   const dominantPollutant =
     aqiPm25 >= aqiPm10 && aqiPm25 >= aqiNo2
       ? 'PM2.5'
@@ -170,46 +297,100 @@ async function fetchLiveOpenMeteo(
   const currentHour = currentHourMatch ? Number(currentHourMatch[1]) : new Date().getHours();
 
   const times = aqJson.hourly?.time ?? [];
-  const rawHours = Array.from({ length: 24 }, (_, hour24) => {
-    const hAqiRaw = aqJson.hourly?.us_aqi?.[hour24];
-    const hPm25Raw = aqJson.hourly?.pm2_5?.[hour24];
-    const hNo2Raw = aqJson.hourly?.nitrogen_dioxide?.[hour24];
-    const hPm25 = Number(((hPm25Raw ?? aqJson.current?.pm2_5 ?? 18) * pm25Factor).toFixed(1));
-    const hNo2 = Number(
-      ((hNo2Raw ?? aqJson.current?.nitrogen_dioxide ?? 22) * no2Factor).toFixed(1)
-    );
-    const baseHourAqi =
-      hAqiRaw != null ? Math.round(hAqiRaw + aqiOffset) : Math.round(pm25ToAqi(hPm25) + aqiOffset);
-    const hAqi = Math.max(10, Math.min(480, baseHourAqi));
+  const buildDayHours = (dayIndex: number) => {
+    const start = dayIndex * 24;
+    const dayRaw = Array.from({ length: 24 }, (_, hourIdx) => {
+      const idx = start + hourIdx;
+      const hPm25Raw = aqJson.hourly?.pm2_5?.[idx];
+      const hPm10Raw = aqJson.hourly?.pm10?.[idx];
+      const hNo2Raw = aqJson.hourly?.nitrogen_dioxide?.[idx];
+      const hPm25 = Number(((hPm25Raw ?? aqJson.current?.pm2_5 ?? 18) * pm25Factor).toFixed(1));
+      const hPm10 = Number(((hPm10Raw ?? aqJson.current?.pm10 ?? 34) * pm10Factor).toFixed(1));
+      const hNo2 = Number(
+        ((hNo2Raw ?? aqJson.current?.nitrogen_dioxide ?? 22) * no2Factor).toFixed(1)
+      );
+      const hAqi = Math.max(
+        10,
+        Math.min(480, Math.max(pm25ToAqi(hPm25), pm10ToAqi(hPm10), no2ToAqi(hNo2)))
+      );
+      const hIndia = computeIndiaNaqi(hPm25, hPm10, hNo2);
+      const parsedHour = times[idx]?.match(/T(\d{2}):/);
+      const hr = parsedHour ? Number(parsedHour[1]) : hourIdx;
+      return { hour24: hr, hAqi, hPm25, hNo2, hIndia };
+    });
 
-    const parsedHour = times[hour24]?.match(/T(\d{2}):/);
-    const hr = parsedHour ? Number(parsedHour[1]) : hour24;
-    return { hour24: hr, hAqi, hPm25, hNo2 };
-  });
+    const minAqi = Math.min(...dayRaw.map((h) => h.hAqi));
+    const maxAqi = Math.max(...dayRaw.map((h) => h.hAqi));
 
-  const minAqi = Math.min(...rawHours.map((h) => h.hAqi));
-  const maxAqi = Math.max(...rawHours.map((h) => h.hAqi));
+    const pts: HourlyPoint[] = dayRaw.map((h) => ({
+      hourLabel: formatHourLabel(h.hour24),
+      hour24: h.hour24,
+      aqi: h.hAqi,
+      pm25: h.hPm25,
+      no2: h.hNo2,
+      status: getAqiStatus(h.hAqi),
+      band: classifyHourBand(h.hAqi, minAqi, maxAqi),
+      isCurrentHour: dayIndex === 0 && h.hour24 === currentHour,
+    }));
 
-  const hourly: HourlyPoint[] = rawHours.map((h) => ({
-    hourLabel: formatHourLabel(h.hour24),
-    hour24: h.hour24,
-    aqi: h.hAqi,
-    pm25: h.hPm25,
-    no2: h.hNo2,
-    status: getAqiStatus(h.hAqi),
-    band: classifyHourBand(h.hAqi, minAqi, maxAqi),
-    isCurrentHour: h.hour24 === currentHour,
-  }));
+    return { dayRaw, pts, minAqi, maxAqi };
+  };
 
-  const windows = computeWindows(hourly);
+  const todayBlock = buildDayHours(0);
+  const windows = computeWindows(todayBlock.pts);
+  const indiaAqi = computeIndiaNaqi(pm25, pm10, no2);
+
+  // Build 3-day outlook from live Open-Meteo 72h data
+  const totalAvailableDays = Math.min(3, Math.max(1, Math.floor(times.length / 24) || 1));
+  const dailyOutlook: DailyOutlookPoint[] = Array.from(
+    { length: totalAvailableDays },
+    (_, dayIdx) => {
+      const block = dayIdx === 0 ? todayBlock : buildDayHours(dayIdx);
+      const avgAqi = Math.round(
+        block.pts.reduce((acc, h) => acc + h.aqi, 0) / block.pts.length
+      );
+      const indiaAvgAqi = Math.round(
+        block.dayRaw.reduce((acc, h) => acc + h.hIndia, 0) / block.dayRaw.length
+      );
+      const dayWin = computeWindows(block.pts);
+      const dateStr =
+        times[dayIdx * 24]?.slice(0, 10) ??
+        new Date(Date.now() + dayIdx * 86400000).toISOString().slice(0, 10);
+      const parsedDate = new Date(`${dateStr}T12:00:00`);
+      const dayLabel =
+        dayIdx === 0
+          ? 'Today'
+          : dayIdx === 1
+          ? 'Tomorrow'
+          : parsedDate.toLocaleDateString('en-US', {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric',
+            });
+
+      return {
+        dayLabel,
+        dateIso: dateStr,
+        minAqi: block.minAqi,
+        avgAqi,
+        maxAqi: block.maxAqi,
+        indiaAvgAqi,
+        status: getAqiStatus(avgAqi),
+        indiaStatus: getIndiaNaqiStatus(indiaAvgAqi),
+        bestWindowLabel: dayWin.cleanestWindow.label,
+      };
+    }
+  );
 
   return {
     city: resolvedCity,
     country: resolvedCountry || 'Monitoring Grid',
-    neighborhood: nb?.name ?? (neighborhoodQuery?.trim() || 'Central Station'),
-    zoneType: nb?.zoneType ?? 'Urban Airshed',
+    neighborhood: resolvedNeighborhood || 'Central Area',
+    zoneType,
     aqi,
     status,
+    indiaAqi,
+    indiaStatus: getIndiaNaqiStatus(indiaAqi),
     dominantPollutant,
     pm25,
     pm10,
@@ -219,10 +400,158 @@ async function fetchLiveOpenMeteo(
     windKmh,
     updatedAt: new Date().toISOString(),
     source: 'live',
-    sourceLabel: 'Live Sensor Feed · Open-Meteo',
-    hourly,
+    sourceLabel: 'Open-Meteo Live Model (Satellite + Weather)',
+    hourly: todayBlock.pts,
+    dailyOutlook,
     ...windows,
   };
+}
+
+async function fetchLiveOpenMeteo(
+  cityQuery: string,
+  neighborhoodQuery?: string
+): Promise<AirQualityPayload | null> {
+  const resolved = resolveCityAndNeighborhood(cityQuery, neighborhoodQuery);
+  const preset = resolved.preset;
+  let resolvedNbProfile = preset
+    ? resolved.neighborhood ??
+      (resolved.resolvedNeighborhoodName
+        ? getCustomNeighborhoodFactors(preset.name, resolved.resolvedNeighborhoodName)
+        : preset.neighborhoods[0])
+    : resolved.resolvedNeighborhoodName
+    ? getCustomNeighborhoodFactors(resolved.resolvedCityName, resolved.resolvedNeighborhoodName)
+    : null;
+
+  let lat = resolvedNbProfile?.lat ?? preset?.lat;
+  let lon = resolvedNbProfile?.lon ?? preset?.lon;
+  let resolvedCity = preset?.name ?? resolved.resolvedCityName;
+  let resolvedCountry = preset?.country ?? '';
+  let resolvedNeighborhoodLabel =
+    resolvedNbProfile?.name ?? (neighborhoodQuery?.trim() || '');
+
+  if (lat === undefined || lon === undefined) {
+    const parts = cityQuery
+      .split(/[,-]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    let match: GeoCandidate | null = null;
+    if (parts.length === 2) {
+      const [first, second] = parts;
+      const areaMatch = await geocodeOpenMeteo(first, second);
+      if (areaMatch) {
+        match = areaMatch;
+        const countryOrStateMatch =
+          areaMatch.country?.toLowerCase().includes(second.toLowerCase()) ||
+          areaMatch.admin1?.toLowerCase().includes(second.toLowerCase());
+
+        if (countryOrStateMatch && !areaMatch.population) {
+          resolvedCity = areaMatch.name;
+          resolvedNeighborhoodLabel = neighborhoodQuery?.trim() || areaMatch.name;
+        } else if (countryOrStateMatch) {
+          resolvedCity = areaMatch.name;
+        } else {
+          resolvedCity = second
+            .split(/\s+/)
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(' ');
+          resolvedNeighborhoodLabel = areaMatch.name;
+          resolvedNbProfile = getCustomNeighborhoodFactors(resolvedCity, areaMatch.name);
+        }
+      } else {
+        const cityMatch = await geocodeOpenMeteo(second);
+        if (cityMatch) {
+          match = cityMatch;
+          resolvedCity = cityMatch.name;
+          resolvedNeighborhoodLabel =
+            neighborhoodQuery?.trim() ||
+            first
+              .split(/\s+/)
+              .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+              .join(' ');
+          resolvedNbProfile = getCustomNeighborhoodFactors(
+            resolvedCity,
+            resolvedNeighborhoodLabel
+          );
+        }
+      }
+    } else {
+      match = await geocodeOpenMeteo(resolved.resolvedCityName);
+      if (match) {
+        resolvedCity = match.name;
+      }
+    }
+
+    if (!match) return null;
+    lat = match.latitude;
+    lon = match.longitude;
+    resolvedCountry = [match.admin1, match.country].filter(Boolean).join(', ') || 'Global Station';
+  }
+
+  // If user requested a non-preset neighborhood inside any preset or global city,
+  // refine coordinates to the exact neighborhood when found within 45 km of the city center.
+  const hasPresetAreaCoords = Boolean(resolvedNbProfile?.lat !== undefined && resolvedNbProfile?.lon !== undefined);
+  if (!hasPresetAreaCoords && resolvedNeighborhoodLabel && lat !== undefined && lon !== undefined) {
+    const areaCoords = await geocodeNeighborhoodWithinCity(
+      resolvedNeighborhoodLabel,
+      resolvedCity,
+      lat,
+      lon
+    );
+    if (areaCoords) {
+      lat = areaCoords.lat;
+      lon = areaCoords.lon;
+    }
+  }
+
+  return fetchLiveOpenMeteoForCoords({
+    lat,
+    lon,
+    resolvedCity,
+    resolvedCountry,
+    resolvedNeighborhood: resolvedNeighborhoodLabel || resolvedNbProfile?.name || 'Central Area',
+    zoneType: resolvedNbProfile?.zoneType ?? 'Urban Area',
+    nbFactors: resolvedNbProfile,
+    defaultWeather: preset
+      ? { tempC: preset.tempC, humidityPct: preset.humidityPct, windKmh: preset.windKmh }
+      : undefined,
+  });
+}
+
+async function fetchLiveOpenMeteoByCoords(
+  lat: number,
+  lon: number
+): Promise<AirQualityPayload | null> {
+  const closestPreset = findClosestPresetByCoords(lat, lon);
+  const rev = await reverseGeocodeCoords(lat, lon);
+
+  const city = closestPreset?.preset.name ?? rev?.city ?? 'Your Location';
+  const country = closestPreset?.preset.country ?? rev?.country ?? 'GPS Coordinates';
+  const neighborhood =
+    closestPreset?.neighborhood?.name ?? rev?.neighborhood ?? 'Nearby Area';
+
+  const nbFactors =
+    closestPreset?.neighborhood ??
+    (neighborhood && neighborhood !== city
+      ? getCustomNeighborhoodFactors(city, neighborhood)
+      : null);
+
+  return fetchLiveOpenMeteoForCoords({
+    lat,
+    lon,
+    resolvedCity: city,
+    resolvedCountry: country,
+    resolvedNeighborhood: neighborhood,
+    zoneType: nbFactors?.zoneType ?? 'Current GPS Location',
+    nbFactors,
+    defaultWeather: closestPreset?.preset
+      ? {
+          tempC: closestPreset.preset.tempC,
+          humidityPct: closestPreset.preset.humidityPct,
+          windKmh: closestPreset.preset.windKmh,
+        }
+      : undefined,
+  });
 }
 
 app.get('/api/health', (_req, res) => {
@@ -230,6 +559,24 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/air-quality', async (req, res) => {
+  const latParam = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
+  const lonParam = req.query.lon !== undefined ? Number(req.query.lon) : NaN;
+
+  if (Number.isFinite(latParam) && Number.isFinite(lonParam)) {
+    try {
+      const gpsData = await fetchLiveOpenMeteoByCoords(latParam, lonParam);
+      if (gpsData) {
+        res.json(gpsData);
+        return;
+      }
+    } catch {
+      // Fall through cleanly if live coordinate lookup fails
+    }
+    const fallback = buildSimulatedAirQuality('Bengaluru', 'Indiranagar');
+    res.json(fallback);
+    return;
+  }
+
   const city = String(req.query.city || 'Bengaluru').trim();
   const neighborhood = req.query.neighborhood ? String(req.query.neighborhood).trim() : undefined;
 
@@ -297,27 +644,28 @@ app.post('/api/assistant', async (req, res) => {
     .map((h) => `${h.hourLabel}: AQI ${h.aqi} (${h.band})`)
     .join(', ');
 
-  const systemInstruction = `You are AeroSense, an evidence-based urban air quality and respiratory health assistant.
-Give clear, practical, empathetic, and concise guidance (usually 2–4 short paragraphs or crisp bullet points, under 150 words) strictly grounded in the live dashboard telemetry provided below.
+  const systemInstruction = `You are AeroSense, a calm, friendly, easy-to-understand everyday air quality guide.
+Explain air quality in simple everyday language (no scary medical jargon, short clear bullets under 140 words) using the data below.
 
-Current Station Context:
-- City & Neighborhood: ${airQuality.city}, ${airQuality.country} — ${airQuality.neighborhood} (${airQuality.zoneType})
-- Overall AQI: ${airQuality.aqi} (${airQuality.status})
-- Dominant Pollutant: ${airQuality.dominantPollutant}
-- Fine Particulates PM2.5: ${airQuality.pm25} µg/m³ (WHO 24h guideline: 15 µg/m³)
-- Coarse Particulates PM10: ${airQuality.pm10} µg/m³ (WHO 24h guideline: 45 µg/m³)
-- Nitrogen Dioxide NO2: ${airQuality.no2} µg/m³ (WHO 24h guideline: 25 µg/m³)
-- Meteorology: ${airQuality.tempC}°C, ${airQuality.humidityPct}% humidity, ${airQuality.windKmh} km/h wind
-- Cleanest 3h Window Today: ${airQuality.cleanestWindow.label} (avg AQI ${airQuality.cleanestWindow.avgAqi})
-- Peak Traffic Window Today: ${airQuality.peakTrafficWindow.label} (avg AQI ${airQuality.peakTrafficWindow.avgAqi})
-- Sampled 24h Curve: ${hourlySummary}
-- Active User Profile: ${activeProfile}
+Current Location Data:
+- Area: ${airQuality.neighborhood}, ${airQuality.city}, ${airQuality.country} (${airQuality.zoneType})
+- Data Basis: ${airQuality.sourceLabel} (hourly regional Copernicus atmospheric model via Open-Meteo, gently adjusted for local traffic/greenery)
+- US AQI Score: ${airQuality.aqi} (${airQuality.status})${airQuality.indiaAqi ? `\n- India CPCB Scale Equivalent: ~${airQuality.indiaAqi} (${airQuality.indiaStatus})` : ''}
+- Main Pollutant: ${airQuality.dominantPollutant}
+- PM2.5 (Tiny Particles): ${airQuality.pm25} µg/m³ (India 24h safe limit: 60 µg/m³)
+- PM10 (Road Dust): ${airQuality.pm10} µg/m³ (India 24h safe limit: 100 µg/m³)
+- NO2 (Traffic Exhaust): ${airQuality.no2} µg/m³ (India 24h safe limit: 80 µg/m³)
+- Weather: ${airQuality.tempC}°C, ${airQuality.humidityPct}% humidity, ${airQuality.windKmh} km/h wind
+- Cleanest 3h Window: ${airQuality.cleanestWindow.label} (avg AQI ${airQuality.cleanestWindow.avgAqi})
+- Busy Traffic Window: ${airQuality.peakTrafficWindow.label} (avg AQI ${airQuality.peakTrafficWindow.avgAqi})
+- 24h Trend: ${hourlySummary}
+- User Profile: ${activeProfile}
 
 Rules:
-1. Reference the exact numbers from the context (AQI, PM2.5, NO2, or specific time windows) so the advice feels tailored to ${airQuality.neighborhood}.
-2. When asked about timing (e.g., running at 6 PM), check the 24h curve and compare against the cleanest window.
-3. Recommend specific mask grades (e.g., N95/FFP2/KN95) only when justified by AQI/PM2.5/NO2 and the user's profile; never give false reassurance when AQI is Poor or Severe.
-4. For medical emergencies or worsening asthma symptoms, briefly advise consulting a clinician or using prescribed rescue medication.`;
+1. Keep the tone calm, honest, and reassuring—avoid alarmist wording. Mention exact numbers simply so anyone can follow.
+2. If asked about data accuracy or why numbers look high/different, explain honestly that Open-Meteo uses a regional weather/satellite grid (~10–25 km) rather than a street sensor, so numbers can differ ~15–25% from roadside CPCB stations, and that US AQI runs stricter than India's CPCB scale.
+3. For timing questions (like running at 6 PM), check the 24h trend and suggest the cleanest window if helpful.
+4. Recommend masks (KN95/N95) only when needed for the profile and current traffic/AQI level.`;
 
   const conversationTurns = (history ?? []).slice(-6).map((msg) => ({
     role: msg.role === 'assistant' ? 'model' : 'user',

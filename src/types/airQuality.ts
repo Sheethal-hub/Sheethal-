@@ -9,8 +9,10 @@ export type UserProfile =
 export interface NeighborhoodPreset {
   id: string;
   name: string;
+  aliases?: string[];
   zoneType: string;
-  aqiOffset: number;
+  lat?: number;
+  lon?: number;
   pm25Factor: number;
   pm10Factor: number;
   no2Factor: number;
@@ -19,6 +21,7 @@ export interface NeighborhoodPreset {
 export interface CityPreset {
   id: string;
   name: string;
+  aliases?: string[];
   country: string;
   lat: number;
   lon: number;
@@ -43,6 +46,27 @@ export interface HourlyPoint {
   isCurrentHour: boolean;
 }
 
+export interface DailyOutlookPoint {
+  dayLabel: string;
+  dateIso: string;
+  minAqi: number;
+  avgAqi: number;
+  maxAqi: number;
+  indiaAvgAqi: number;
+  status: AqiStatus;
+  indiaStatus: string;
+  bestWindowLabel: string;
+}
+
+export interface PinnedLocation {
+  id: string;
+  city: string;
+  neighborhood: string;
+  aqi: number;
+  indiaAqi?: number;
+  status: AqiStatus;
+}
+
 export interface AirQualityPayload {
   city: string;
   country: string;
@@ -50,6 +74,8 @@ export interface AirQualityPayload {
   zoneType: string;
   aqi: number;
   status: AqiStatus;
+  indiaAqi?: number;
+  indiaStatus?: string;
   dominantPollutant: 'PM2.5' | 'PM10' | 'NO2';
   pm25: number;
   pm10: number;
@@ -61,6 +87,7 @@ export interface AirQualityPayload {
   source: 'live' | 'calibrated';
   sourceLabel: string;
   hourly: HourlyPoint[];
+  dailyOutlook?: DailyOutlookPoint[];
   cleanestWindow: {
     label: string;
     avgAqi: number;

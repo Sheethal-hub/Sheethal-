@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { BarChart3, Clock, TrendingUp } from 'lucide-react';
+import { BarChart3, Calendar, Clock, TrendingUp } from 'lucide-react';
 import type { AirQualityPayload, HourlyPoint } from '../types/airQuality';
 import { getQuickExposureTips } from '../utils/recommendations';
 
@@ -32,7 +32,7 @@ const BAND_COLORS: Record<
 };
 
 export function TrendChartAndTips({ data }: TrendChartAndTipsProps) {
-  const [chartMode, setChartMode] = useState<'bars' | 'line'>('bars');
+  const [chartMode, setChartMode] = useState<'bars' | 'line' | '3day'>('bars');
   const [activeIndex, setActiveIndex] = useState<number>(() => {
     const idx = data.hourly.findIndex((h) => h.isCurrentHour);
     return idx >= 0 ? idx : 12;
@@ -79,7 +79,7 @@ export function TrendChartAndTips({ data }: TrendChartAndTipsProps) {
                 24-Hour Air Quality Trend
               </h2>
               <p className="mt-0.5 text-xs text-slate-500">
-                Hourly AQI curve for {data.neighborhood} · Hover or tap any hour
+                Hourly forecast for {data.neighborhood} · Tap or hover any bar to check that hour
               </p>
             </div>
 
@@ -108,9 +108,64 @@ export function TrendChartAndTips({ data }: TrendChartAndTipsProps) {
                 <TrendingUp className="h-3.5 w-3.5" aria-hidden="true" />
                 <span>Line</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setChartMode('3day')}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[34px] cursor-pointer ${
+                  chartMode === '3day'
+                    ? 'bg-white text-slate-950 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-950'
+                }`}
+              >
+                <Calendar className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>3-Day</span>
+              </button>
             </div>
           </div>
 
+          {chartMode === '3day' ? (
+            <div className="mt-5 grid grid-cols-1 gap-4 divide-y divide-slate-900/8 sm:grid-cols-3 sm:gap-0 sm:divide-x sm:divide-y-0">
+              {(data.dailyOutlook ?? []).map((day, idx) => (
+                <div
+                  key={day.dateIso}
+                  className={`flex flex-col justify-between gap-3 ${
+                    idx === 0
+                      ? 'pb-4 sm:pb-0 sm:pr-5'
+                      : idx === 1
+                      ? 'py-4 sm:py-0 sm:px-5'
+                      : 'pt-4 sm:pt-0 sm:pl-5'
+                  }`}
+                >
+                  <div>
+                    <div className="text-xs font-semibold text-slate-500">
+                      {day.dayLabel}
+                    </div>
+                    <div className="mt-2 flex items-baseline gap-2">
+                      <span className="font-display text-4xl font-bold text-slate-950 tabular-nums">
+                        {day.avgAqi}
+                      </span>
+                      <span className="font-mono text-xs text-slate-500">
+                        avg US AQI
+                      </span>
+                    </div>
+                    <div className="mt-1 text-xs font-medium text-slate-700">
+                      {day.status} · India CPCB ~{day.indiaAvgAqi} ({day.indiaStatus})
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5 border-t border-slate-900/8 pt-3 text-xs text-slate-600 font-mono tabular-nums">
+                    <div>
+                      Range: <strong className="text-slate-900">{day.minAqi}–{day.maxAqi}</strong>
+                    </div>
+                    <div className="text-emerald-800 font-semibold">
+                      Best: {day.bestWindowLabel}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
           {/* Active Hour Readout Strip */}
           {activePoint && (
             <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-900/8 bg-white/65 px-4 py-2.5 text-xs">
@@ -270,6 +325,8 @@ export function TrendChartAndTips({ data }: TrendChartAndTipsProps) {
               })}
             </svg>
           </div>
+            </>
+          )}
         </div>
 
         {/* Chart Legend & Best/Peak Window Strip */}
@@ -285,7 +342,7 @@ export function TrendChartAndTips({ data }: TrendChartAndTipsProps) {
             </span>
             <span className="inline-flex items-center gap-1.5">
               <span className="h-2.5 w-2.5 rounded-xs bg-rose-600" aria-hidden="true" />
-              Peak Traffic
+              Busy Traffic
             </span>
           </div>
 
@@ -294,7 +351,7 @@ export function TrendChartAndTips({ data }: TrendChartAndTipsProps) {
               Best: {data.cleanestWindow.label}
             </span>
             <span className="text-rose-800 font-semibold">
-              Peak: {data.peakTrafficWindow.label}
+              Busy: {data.peakTrafficWindow.label}
             </span>
           </div>
         </div>
@@ -304,10 +361,10 @@ export function TrendChartAndTips({ data }: TrendChartAndTipsProps) {
       <div className="glass-panel flex flex-col justify-between rounded-2xl p-6 sm:p-7 lg:col-span-5">
         <div>
           <h2 className="text-xl font-bold tracking-tight text-slate-950 font-display">
-            Clean Route & Exposure Tips
+            3 Simple Ways to Stay Fresh
           </h2>
           <p className="mt-0.5 text-xs text-slate-500">
-            3 practical steps tailored to {data.city}’s pollutant mix today
+            Easy daily habits tailored to {data.city}’s air today
           </p>
 
           <div className="mt-5 divide-y divide-slate-900/8">

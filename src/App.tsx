@@ -9,7 +9,14 @@ import { HealthAdvisor } from './components/HealthAdvisor';
 import { IndianMetroGrid } from './components/IndianMetroGrid';
 import { TrendChartAndTips } from './components/TrendChartAndTips';
 import { buildSimulatedAirQuality, INDIAN_METRO_NAMES } from './data/cities';
-import type { AirQualityPayload, AqiStatus, UserProfile } from './types/airQuality';
+import type {
+  AirQualityPayload,
+  AqiStatus,
+  PinnedLocation,
+  UserProfile,
+} from './types/airQuality';
+
+const PINNED_STORAGE_KEY = 'aerosense_pinned_v1';
 
 const DYNAMIC_THEME: Record<
   AqiStatus,
@@ -41,6 +48,21 @@ const DYNAMIC_THEME: Record<
   },
 };
 
+function makePinId(city: string, neighborhood: string): string {
+  return `${city.trim().toLowerCase()}::${neighborhood.trim().toLowerCase()}`;
+}
+
+function loadInitialPins(): PinnedLocation[] {
+  try {
+    const raw = window.localStorage.getItem(PINNED_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PinnedLocation[]).slice(0, 6) : [];
+  } catch {
+    return [];
+  }
+}
+
 async function fetchAirQualityEndpoint(
   city: string,
   neighborhood?: string
@@ -56,6 +78,21 @@ async function fetchAirQualityEndpoint(
   return (await res.json()) as AirQualityPayload;
 }
 
+async function fetchAirQualityByCoords(
+  lat: number,
+  lon: number
+): Promise<AirQualityPayload> {
+  const params = new URLSearchParams({
+    lat: lat.toFixed(4),
+    lon: lon.toFixed(4),
+  });
+  const res = await fetch(`/api/air-quality?${params.toString()}`);
+  if (!res.ok) {
+    throw new Error('Unable to load air quality data for your current location.');
+  }
+  return (await res.json()) as AirQualityPayload;
+}
+
 export default function App() {
   const [selectedCity, setSelectedCity] = useState('Bengaluru');
   const [selectedNeighborhood, setSelectedNeighborhood] = useState('Indiranagar');
@@ -65,6 +102,15 @@ export default function App() {
   );
   const [isLoading, setIsLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+
+  // Near Me GPS state
+  const [isLocating, setIsLocating] = useState(false);
+  const [locationNotice, setLocationNotice] = useState<string | null>(null);
+
+  // Saved Places Watchlist
+  const [pinnedLocations, setPinnedLocations] = useState<PinnedLocation[]>(() =>
+    loadInitialPins()
+  );
 
   // Comparison Mode state
   const [compareMode, setCompareMode] = useState(false);
@@ -80,15 +126,44 @@ export default function App() {
   );
   const [isLoadingMetros, setIsLoadingMetros] = useState(false);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(pinnedLocations));
+    } catch {
+      // Ignore storage quota errors silently
+    }
+  }, [pinnedLocations]);
+
+  // Keep pinned place badge metrics fresh when loading that place
+  const syncPinSnapshot = useCallback((payload: AirQualityPayload) => {
+    const pinId = makePinId(payload.city, payload.neighborhood);
+    setPinnedLocations((prev) =>
+      prev.some((p) => p.id === pinId)
+        ? prev.map((p) =>
+            p.id === pinId
+              ? {
+                  ...p,
+                  aqi: payload.aqi,
+                  indiaAqi: payload.indiaAqi,
+                  status: payload.status,
+                }
+              : p
+          )
+        : prev
+    );
+  }, []);
+
   const loadAirQuality = useCallback(
     async (city: string, neighborhood?: string) => {
       setIsLoading(true);
       setFetchError(null);
+      setLocationNotice(null);
       try {
         const payload = await fetchAirQualityEndpoint(city, neighborhood);
         setAirQuality(payload);
         setSelectedCity(payload.city);
         setSelectedNeighborhood(payload.neighborhood);
+        syncPinSnapshot(payload);
       } catch (err: unknown) {
         const message =
           err instanceof Error
@@ -103,7 +178,7 @@ export default function App() {
         setIsLoading(false);
       }
     },
-    []
+    [syncPinSnapshot]
   );
 
   const loadCompareCity = useCallback(
@@ -143,6 +218,70 @@ export default function App() {
 
   const handleSelectLocation = (city: string, neighborhood?: string) => {
     void loadAirQuality(city, neighborhood);
+  };
+
+  const handleUseMyLocation = () => {
+    if (!navigator.geolocation) {
+      setLocationNotice(
+        'Location access is unavailable in this browser. Type your city or area instead.'
+      );
+      return;
+    }
+
+    setIsLocating(true);
+    setLocationNotice(null);
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        try {
+          const payload = await fetchAirQualityByCoords(
+            pos.coords.latitude,
+            pos.coords.longitude
+          );
+          setAirQuality(payload);
+          setSelectedCity(payload.city);
+          setSelectedNeighborhood(payload.neighborhood);
+          syncPinSnapshot(payload);
+        } catch {
+          setLocationNotice(
+            'Could not fetch live readings for GPS coordinates. Try searching your area name.'
+          );
+        } finally {
+          setIsLocating(false);
+        }
+      },
+      () => {
+        setIsLocating(false);
+        setLocationNotice(
+          'Location permission was blocked. Enable location access or type your area in the search bar.'
+        );
+      },
+      { enableHighAccuracy: false, timeout: 7000, maximumAge: 180000 }
+    );
+  };
+
+  const activePinId = makePinId(airQuality.city, airQuality.neighborhood);
+  const isCurrentPinned = pinnedLocations.some((p) => p.id === activePinId);
+
+  const handleTogglePin = () => {
+    setPinnedLocations((prev) => {
+      if (prev.some((p) => p.id === activePinId)) {
+        return prev.filter((p) => p.id !== activePinId);
+      }
+      const nextPin: PinnedLocation = {
+        id: activePinId,
+        city: airQuality.city,
+        neighborhood: airQuality.neighborhood,
+        aqi: airQuality.aqi,
+        indiaAqi: airQuality.indiaAqi,
+        status: airQuality.status,
+      };
+      return [nextPin, ...prev].slice(0, 6);
+    });
+  };
+
+  const handleRemovePin = (id: string) => {
+    setPinnedLocations((prev) => prev.filter((p) => p.id !== id));
   };
 
   const handleToggleCompareMode = () => {
@@ -221,6 +360,11 @@ export default function App() {
             selectedCity={selectedCity}
             selectedNeighborhood={selectedNeighborhood}
             onSelectLocation={handleSelectLocation}
+            onUseMyLocation={handleUseMyLocation}
+            isLocating={isLocating}
+            locationNotice={locationNotice}
+            pinnedLocations={pinnedLocations}
+            onRemovePin={handleRemovePin}
             isLoading={isLoading}
             compareMode={compareMode}
             onToggleCompareMode={handleToggleCompareMode}
@@ -234,7 +378,7 @@ export default function App() {
               className="flex items-center gap-2.5 rounded-xl border border-amber-500/30 bg-amber-50/90 px-4 py-3 text-xs font-medium text-amber-900"
             >
               <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" aria-hidden="true" />
-              <span>{fetchError} Showing calibrated urban model data instead.</span>
+              <span>{fetchError} Showing offline area estimates instead.</span>
             </div>
           )}
 
@@ -262,7 +406,13 @@ export default function App() {
             />
           )}
 
-          <AqiHeroPanel data={airQuality} isLoading={isLoading} />
+          <AqiHeroPanel
+            data={airQuality}
+            profile={profile}
+            isLoading={isLoading}
+            isPinned={isCurrentPinned}
+            onTogglePin={handleTogglePin}
+          />
 
           <HealthAdvisor
             data={airQuality}
@@ -281,7 +431,7 @@ export default function App() {
               AeroSense · Urban Air Quality Assistant
             </div>
             <div>
-              Reference thresholds based on US EPA AQI &amp; WHO 24-hour guidelines
+              Live atmospheric forecasts via Open-Meteo · US EPA AQI &amp; India CPCB scales
             </div>
           </div>
         </footer>

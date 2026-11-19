@@ -1,6 +1,14 @@
-import { Activity, DoorOpen, MapPin, Shield } from 'lucide-react';
+import { useState } from 'react';
+import { Activity, Clock, DoorOpen, MapPin, Shield } from 'lucide-react';
 import type { AdviceItem, AirQualityPayload, UserProfile } from '../types/airQuality';
-import { getHealthRecommendations, getLocalMetroAdvisory, USER_PROFILES } from '../utils/recommendations';
+import {
+  ACTIVITY_OPTIONS,
+  getBestActivityWindow,
+  getHealthRecommendations,
+  getLocalMetroAdvisory,
+  USER_PROFILES,
+  type ActivityId,
+} from '../utils/recommendations';
 
 interface HealthAdvisorProps {
   data: AirQualityPayload;
@@ -45,8 +53,10 @@ export function HealthAdvisor({
   profile,
   onProfileChange,
 }: HealthAdvisorProps) {
+  const [activity, setActivity] = useState<ActivityId>('morning-walk');
   const recommendations = getHealthRecommendations(data, profile);
   const localAdvisory = getLocalMetroAdvisory(data, profile);
+  const activityPlan = getBestActivityWindow(data, activity, profile);
   const activeProfileMeta =
     USER_PROFILES.find((p) => p.id === profile) ?? USER_PROFILES[0];
 
@@ -148,8 +158,59 @@ export function HealthAdvisor({
         })}
       </div>
 
+      {/* Best Time to Go Out Activity Planner */}
+      <div className="mt-6 border-t border-slate-900/8 pt-5">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div className="inline-flex items-center gap-2 text-xs font-semibold text-slate-600">
+            <Clock className="h-3.5 w-3.5 text-slate-500" aria-hidden="true" />
+            <span>When should I go out today?</span>
+          </div>
+
+          <div
+            role="group"
+            aria-label="Pick daily activity"
+            className="flex flex-wrap gap-1.5"
+          >
+            {ACTIVITY_OPTIONS.map((opt) => {
+              const selected = opt.id === activity;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setActivity(opt.id)}
+                  aria-pressed={selected}
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 min-h-[34px] cursor-pointer ${
+                    selected
+                      ? 'bg-slate-900 text-white'
+                      : 'border border-slate-200 bg-white/80 text-slate-700 hover:bg-white hover:text-slate-950'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-col gap-1.5 rounded-xl border border-slate-900/8 bg-white/60 px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+          <div className="text-slate-700 leading-relaxed">
+            <span className="font-semibold text-emerald-800">
+              Best window: {activityPlan.bestLabel}
+            </span>{' '}
+            <span className="font-mono text-slate-500 tabular-nums">
+              (avg US AQI ~{activityPlan.bestAvgAqi})
+            </span>{' '}
+            <span aria-hidden="true" className="text-slate-400">·</span>{' '}
+            <span>{activityPlan.tip}</span>
+          </div>
+          <div className="font-mono text-[11px] font-medium text-rose-700 whitespace-nowrap shrink-0 tabular-nums">
+            Avoid {activityPlan.avoidLabel}
+          </div>
+        </div>
+      </div>
+
       {/* Local Regional Context Strip */}
-      <div className="mt-6 flex flex-col gap-2 border-t border-slate-900/8 pt-5 sm:flex-row sm:items-center sm:justify-between">
+      <div className="mt-5 flex flex-col gap-2 border-t border-slate-900/8 pt-5 sm:flex-row sm:items-center sm:justify-between">
         <div className="space-y-1">
           <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500">
             <MapPin className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />

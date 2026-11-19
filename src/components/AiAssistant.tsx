@@ -11,8 +11,8 @@ interface AiAssistantProps {
 
 const SUGGESTED_PROMPTS = [
   'Is it safe to run at 6 PM?',
+  'How accurate is this data?',
   'How do I reduce indoor dust today?',
-  'Do I need an N95 mask for commuting?',
   'When should I open my windows today?',
 ];
 
@@ -170,11 +170,11 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
         {messages.length === 0 && !isSending ? (
           <div className="flex h-full min-h-[104px] flex-col items-center justify-center text-center px-4">
             <p className="text-sm font-medium text-slate-700">
-              Ask about run timing, indoor air filtration, commute routes, or mask fit for{' '}
+              Ask anything in plain words — outdoor exercise, home dust, masks, or how these numbers work for{' '}
               <span className="font-semibold text-slate-950">{data.neighborhood}</span>.
             </p>
             <p className="mt-1 text-xs text-slate-500">
-              Click any quick question above or type your own below.
+              Tap a quick question above or type your own below.
             </p>
           </div>
         ) : (
