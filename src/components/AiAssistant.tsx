@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect, type FormEvent } from 'react';
-import { AlertCircle, ArrowUp, MessageSquare, RotateCcw } from 'lucide-react';
+import { ArrowUp, MessageSquare, RotateCcw } from 'lucide-react';
 import type { AirQualityPayload, ChatMessage, UserProfile } from '../types/airQuality';
+import { buildSmartAqiReply } from '../utils/assistantFallback';
 import { USER_PROFILES } from '../utils/recommendations';
 
 interface AiAssistantProps {
@@ -19,7 +20,6 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   const profileLabel =
@@ -28,7 +28,6 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
   // Reset conversation neatly when city changes so stale answers don't confuse users
   useEffect(() => {
     setMessages([]);
-    setError(null);
   }, [data.city, data.neighborhood]);
 
   useEffect(() => {
@@ -54,13 +53,17 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
     const nextHistory = [...messages, userMsg];
     setMessages(nextHistory);
     setInput('');
-    setError(null);
     setIsSending(true);
+
+    let answerText: string | null = null;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 6500);
 
     try {
       const res = await fetch('/api/assistant', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           question: trimmed,
           history: messages,
@@ -69,38 +72,44 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
         }),
       });
 
-      const payload = (await res.json()) as { answer?: string; error?: string };
-      if (!res.ok || !payload.answer) {
-        throw new Error(
-          payload.error || 'AeroSense AI could not respond right now.'
-        );
+      if (res.ok) {
+        const rawText = await res.text();
+        try {
+          const payload = JSON.parse(rawText) as { answer?: string };
+          if (payload.answer && payload.answer.trim()) {
+            answerText = payload.answer.trim();
+          }
+        } catch {
+          // Fall through cleanly to built-in rules
+        }
       }
-
-      const aiMsg: ChatMessage = {
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        content: payload.answer,
-        timestamp: new Date().toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-      };
-
-      setMessages((prev) => [...prev, aiMsg]);
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : 'Network error while reaching AeroSense AI.';
-      setError(msg);
+    } catch {
+      // Network, timeout, or static hosting fallback handled seamlessly below
     } finally {
-      setIsSending(false);
+      window.clearTimeout(timeoutId);
     }
+
+    if (!answerText) {
+      answerText = buildSmartAqiReply(trimmed, data, profile);
+    }
+
+    const aiMsg: ChatMessage = {
+      id: `a-${Date.now()}`,
+      role: 'assistant',
+      content: answerText,
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    };
+
+    setMessages((prev) => [...prev, aiMsg]);
+    setIsSending(false);
   }
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    askQuestion(input);
+    void askQuestion(input);
   };
 
   return (
@@ -129,10 +138,7 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
         {messages.length > 0 && (
           <button
             type="button"
-            onClick={() => {
-              setMessages([]);
-              setError(null);
-            }}
+            onClick={() => setMessages([])}
             className="inline-flex items-center gap-1.5 self-start rounded-lg border border-slate-200 bg-white/80 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-white hover:text-slate-950 transition-colors whitespace-nowrap shrink-0 min-h-[36px] cursor-pointer"
           >
             <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
@@ -148,7 +154,7 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
             key={prompt}
             type="button"
             disabled={isSending}
-            onClick={() => askQuestion(prompt)}
+            onClick={() => void askQuestion(prompt)}
             className="rounded-lg border border-slate-900/10 bg-white/75 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-white hover:text-slate-950 hover:border-slate-900/20 transition-all cursor-pointer disabled:opacity-50 min-h-[36px]"
           >
             {prompt}
@@ -191,7 +197,17 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
                     : 'border border-slate-900/8 bg-white text-slate-800 shadow-2xs'
                 }`}
               >
-                {msg.content}
+                {msg.role === 'assistant'
+                  ? msg.content.split(/(\*\*[^*]+\*\*)/g).map((part, idx) =>
+                      part.startsWith('**') && part.endsWith('**') ? (
+                        <strong key={idx} className="font-semibold text-slate-950">
+                          {part.slice(2, -2)}
+                        </strong>
+                      ) : (
+                        <span key={idx}>{part}</span>
+                      )
+                    )
+                  : msg.content}
               </div>
             </div>
           ))
@@ -209,16 +225,6 @@ export function AiAssistant({ data, profile }: AiAssistantProps) {
           </div>
         )}
       </div>
-
-      {error && (
-        <div
-          role="alert"
-          className="mt-3 flex items-start gap-2.5 rounded-xl border border-rose-500/25 bg-rose-500/10 px-4 py-3 text-xs font-medium text-rose-900"
-        >
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-700" aria-hidden="true" />
-          <span>{error}</span>
-        </div>
-      )}
 
       {/* Ask Form */}
       <form onSubmit={handleSubmit} className="mt-4 flex items-center gap-2.5">

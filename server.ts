@@ -15,6 +15,7 @@ import {
   pm25ToAqi,
 } from './src/data/cities.ts';
 import type { AirQualityPayload, ChatMessage, HourlyPoint, UserProfile } from './src/types/airQuality.ts';
+import { buildSmartAqiReply } from './src/utils/assistantFallback.ts';
 
 dotenv.config();
 
@@ -24,7 +25,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -269,13 +270,15 @@ app.post('/api/assistant', async (req, res) => {
     return;
   }
 
+  const selectedProfile: UserProfile = profile ?? 'general';
+
   let ai: GoogleGenAI;
   try {
     ai = getGeminiClient();
   } catch {
-    res.status(503).json({
-      error:
-        'Gemini API key is not configured yet. Please add GEMINI_API_KEY in Settings > Secrets.',
+    res.json({
+      answer: buildSmartAqiReply(question, airQuality, selectedProfile),
+      mode: 'smart-rules',
     });
     return;
   }
@@ -287,7 +290,7 @@ app.post('/api/assistant', async (req, res) => {
     vulnerable: 'Child / Elderly Caregiver',
   };
 
-  const activeProfile = profileLabels[profile ?? 'general'] ?? profileLabels.general;
+  const activeProfile = profileLabels[selectedProfile] ?? profileLabels.general;
 
   const hourlySummary = airQuality.hourly
     .filter((_, idx) => idx % 2 === 0)
@@ -295,7 +298,7 @@ app.post('/api/assistant', async (req, res) => {
     .join(', ');
 
   const systemInstruction = `You are AeroSense, an evidence-based urban air quality and respiratory health assistant.
-Give clear, practical, empathetic, and concise guidance (usually 2–4 short paragraphs or crisp bullet points, under 160 words) strictly grounded in the live dashboard telemetry provided below.
+Give clear, practical, empathetic, and concise guidance (usually 2–4 short paragraphs or crisp bullet points, under 150 words) strictly grounded in the live dashboard telemetry provided below.
 
 Current Station Context:
 - City & Neighborhood: ${airQuality.city}, ${airQuality.country} — ${airQuality.neighborhood} (${airQuality.zoneType})
@@ -321,54 +324,63 @@ Rules:
     parts: [{ text: msg.content }],
   }));
 
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: [
-        ...conversationTurns,
-        {
-          role: 'user',
-          parts: [{ text: question.trim() }],
-        },
-      ],
+  const contents = [
+    ...conversationTurns,
+    {
+      role: 'user',
+      parts: [{ text: question.trim() }],
+    },
+  ];
+
+  const callModelWithTimeout = async (model: string, timeoutMs: number): Promise<string | null> => {
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('GEMINI_TIMEOUT')), timeoutMs)
+    );
+    const apiPromise = ai.models.generateContent({
+      model,
+      contents,
       config: {
         systemInstruction,
         thinkingConfig: {
-          thinkingLevel: ThinkingLevel.LOW,
+          thinkingLevel:
+            model === 'gemini-3.1-flash-lite'
+              ? ThinkingLevel.MINIMAL
+              : ThinkingLevel.LOW,
         },
       },
     });
+    const response = await Promise.race([apiPromise, timeoutPromise]);
+    return response.text?.trim() || null;
+  };
 
-    const answer = response.text?.trim();
+  try {
+    let answer: string | null = null;
+    try {
+      answer = await callModelWithTimeout('gemini-4-hydrogen', 3200);
+    } catch {
+      // Fast fallback to flash-lite if hydrogen is slow or experiencing high demand
+    }
+
     if (!answer) {
-      res.status(502).json({ error: 'Received an empty response from the assistant. Please retry.' });
-      return;
+      try {
+        answer = await callModelWithTimeout('gemini-3.1-flash-lite', 2600);
+      } catch {
+        // Fall through cleanly to built-in smart health & AQI rules
+      }
     }
 
-    res.json({ answer });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    const statusMatch = message.match(/\b(400|403|404|429)\b/);
-    const statusCode = statusMatch ? Number(statusMatch[1]) : 500;
-
-    if (statusCode === 403 || message.includes('PERMISSION_DENIED') || message.includes('API_KEY_INVALID')) {
-      res.status(403).json({
-        error: 'Gemini API key was rejected or lacks permission. Please verify GEMINI_API_KEY in Settings > Secrets.',
-      });
+    if (answer) {
+      res.json({ answer, mode: 'gemini' });
       return;
     }
-
-    if (statusCode === 429 || message.includes('RESOURCE_EXHAUSTED')) {
-      res.status(429).json({
-        error: 'Rate limit reached on Gemini API. Please wait a moment and try again.',
-      });
-      return;
-    }
-
-    res.status(500).json({
-      error: `Unable to reach AeroSense AI right now (${message}).`,
-    });
+  } catch {
+    // Fall through cleanly to built-in smart health & AQI rules
   }
+
+  res.json({
+    answer: buildSmartAqiReply(question, airQuality, selectedProfile),
+    mode: 'smart-rules',
+  });
 });
 
 async function startServer() {
